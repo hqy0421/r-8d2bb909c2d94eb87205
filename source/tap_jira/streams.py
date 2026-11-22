@@ -9,6 +9,7 @@ from datetime import datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
+import requests
 from singer_sdk import typing as th  # JSON Schema typing helpers
 from singer_sdk.pagination import JSONPathPaginator, OffsetPaginator
 
@@ -22,7 +23,6 @@ else:
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    import requests
     from singer_sdk.helpers.types import Context, Record
 
 PropertiesList = th.PropertiesList
@@ -192,21 +192,59 @@ class FieldStream(JiraStartAtPaginatedStream):
         context: Context | None,
     ) -> dict[str, Any] | None:
         # custom fields only
-        if not record["custom"]:
+        if not record.get("custom"):
+            return None
+
+        field_id = record.get("id")
+        if not field_id:
+            # the field ID keys the child streams, so don't guess it
             return None
 
         schema: dict[str, Any] | None = record.get("schema")
 
         if schema:
-            type_: str = schema.get("items") or schema["type"]
+            type_ = schema.get("items") or schema.get("type")
             supports_options = type_ in {"option", "option-with-child"}
         else:
             supports_options = False
 
         return {
-            "fieldId": record["id"],
+            "fieldId": field_id,
             "supports_options": supports_options,
         }
+
+
+class CustomFieldContextProjectMappingStream(JiraStartAtPaginatedStream):
+    """Custom field context project mapping stream.
+
+    Internal helper used to resolve which projects a custom field context
+    applies to. Not exposed as a tap stream.
+
+    https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-custom-field-contexts/#api-rest-api-3-field-fieldid-context-projectmapping-get
+    """
+
+    name = "custom_field_context_project_mappings"
+    path = "/field/{fieldId}/context/projectmapping"
+    records_jsonpath = "$[values][*]"  # Or override `parse_response`.
+    instance_name = "values"
+
+    schema = th.PropertiesList(
+        th.Property("contextId", th.StringType),
+        th.Property("projectId", th.StringType),
+        th.Property("isGlobalContext", th.BooleanType),
+    ).to_dict()
+
+    @override
+    def get_url_params(
+        self,
+        context: Context | None,
+        next_page_token: int | None,
+    ) -> dict[str, Any]:
+        """Return a dictionary of values to be used in URL parameterization."""
+        params = super().get_url_params(context, next_page_token)
+        if context and (context_id := context.get("contextId")):
+            params["contextId"] = context_id
+        return params
 
 
 class CustomFieldContextStream(JiraStartAtPaginatedStream):
@@ -218,7 +256,7 @@ class CustomFieldContextStream(JiraStartAtPaginatedStream):
     parent_stream_type = FieldStream
     name = "custom_field_contexts"
     path = "/field/{fieldId}/context"
-    primary_keys = ("id",)
+    primary_keys = ("fieldId", "id")
     records_jsonpath = "$[values][*]"  # Or override `parse_response`.
     instance_name = "values"
     state_partitioning_keys = ("fieldId",)
@@ -230,6 +268,7 @@ class CustomFieldContextStream(JiraStartAtPaginatedStream):
         th.Property("isAnyIssueType", th.BooleanType),
         th.Property("isGlobalContext", th.BooleanType),
         th.Property("name", th.StringType),
+        th.Property("projectIds", th.ArrayType(th.StringType)),
     ).to_dict()
 
     @override
@@ -249,15 +288,86 @@ class CustomFieldContextStream(JiraStartAtPaginatedStream):
         record: Record,
         context: Context | None,
     ) -> dict[str, Any] | None:
-        assert context is not None  # noqa: S101
+        if not context or not context.get("supports_options"):
+            return None
 
-        if not context["supports_options"]:
+        field_id = context.get("fieldId")
+        context_id = record.get("id")
+
+        if not field_id or not context_id:
+            # the child stream keys off the field and context IDs, so don't
+            # guess them from an incomplete parent context
             return None
 
         return {
-            "fieldId": context["fieldId"],
-            "contextId": record["id"],
+            "fieldId": field_id,
+            "contextId": context_id,
         }
+
+    @override
+    def post_process(
+        self,
+        row: Record,
+        context: Context | None = None,
+    ) -> Record | None:
+        """Post-process the record.
+
+        - Attach the parent field ID, part of this stream's composite primary
+          key.
+        - Attach the IDs of the projects the context applies to, so that issue
+          records can be matched to the context — and therefore to the custom
+          field options — for their project. The association is left empty
+          when it cannot be determined rather than guessed.
+        """
+        field_id = (context or {}).get("fieldId")
+
+        if not field_id:
+            # the field ID is part of this stream's primary key, so don't
+            # guess it from an incomplete parent context
+            return None
+
+        row["fieldId"] = field_id
+
+        if row.get("isGlobalContext"):
+            # global contexts apply to all projects by definition
+            row["projectIds"] = []
+        elif context_id := row.get("id"):
+            row["projectIds"] = self._get_context_project_ids(field_id, context_id)
+        else:
+            row["projectIds"] = []
+
+        return row
+
+    def _get_context_project_ids(self, field_id: str, context_id: str) -> list[str]:
+        """Return the IDs of the projects a custom field context applies to.
+
+        Args:
+            field_id: The ID of the custom field.
+            context_id: The ID of the custom field context.
+
+        Returns:
+            The mapped project IDs, or an empty list if the mapping cannot be
+            determined.
+        """
+        stream = CustomFieldContextProjectMappingStream(self._tap)
+
+        try:
+            return [
+                str(record["projectId"])
+                for record in stream.get_records(
+                    {"fieldId": field_id, "contextId": context_id},
+                )
+                if str(record.get("contextId")) == context_id
+                and record.get("projectId") is not None
+            ]
+        except requests.RequestException as e:
+            self.logger.warning(
+                "Unable to determine projects for context '%s' of field '%s': %s",
+                context_id,
+                field_id,
+                e,
+            )
+            return []
 
 
 class CustomFieldOptionStream(JiraStartAtPaginatedStream):
@@ -269,9 +379,10 @@ class CustomFieldOptionStream(JiraStartAtPaginatedStream):
     parent_stream_type = CustomFieldContextStream
     name = "custom_field_options"
     path = "/field/{fieldId}/context/{contextId}/option"
-    primary_keys = ("id",)
+    primary_keys = ("fieldId", "contextId", "id")
     records_jsonpath = "$[values][*]"  # Or override `parse_response`.
     instance_name = "values"
+    state_partitioning_keys = ("fieldId", "contextId")
 
     schema = th.PropertiesList(
         th.Property("fieldId", th.StringType),
@@ -280,6 +391,32 @@ class CustomFieldOptionStream(JiraStartAtPaginatedStream):
         th.Property("value", th.StringType),
         th.Property("disabled", th.BooleanType),
     ).to_dict()
+
+    @override
+    def post_process(
+        self,
+        row: Record,
+        context: Context | None = None,
+    ) -> Record | None:
+        """Post-process the record.
+
+        Attach the parent field and context IDs, parts of this stream's
+        composite primary key. Option IDs are only meaningful within their
+        field context — the same option value can have different IDs across
+        contexts — so the full key is required to cross-reference options
+        against issue values. Don't guess the key parts from an incomplete
+        parent context.
+        """
+        field_id = (context or {}).get("fieldId")
+        context_id = (context or {}).get("contextId")
+
+        if not field_id or not context_id:
+            return None
+
+        row["fieldId"] = field_id
+        row["contextId"] = context_id
+
+        return row
 
 
 class ServerInfoStream(JiraStartAtPaginatedStream):
